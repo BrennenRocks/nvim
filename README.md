@@ -11,3 +11,5 @@ chmod u+x nvim.appimage
 mv nvim.appimage nvim
 sudo mv nvim /usr/local/bin
 ```
+
+# Branch `lazy-vim` for LazyVim usage
