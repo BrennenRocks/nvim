@@ -2,7 +2,7 @@ return {
   "nvim-lspconfig",
   opts = {
     inlay_hints = {
-      exclude = { "typescript" },
+      exclude = { "javascript", "typescript", "typescriptreact", "typescript.tsx" },
     },
   },
 }
