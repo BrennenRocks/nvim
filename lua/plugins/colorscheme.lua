@@ -17,11 +17,11 @@ return {
   --     },
   --   },
   -- },
+  -- { "catppuccin/nvim" },
+  -- {
+  --   "LazyVim/LazyVim",
+  --   opts = {
+  --     colorscheme = "catppuccin-frappe",
+  --   },
+  -- },
 }
--- { "catppuccin/nvim" },
--- {
---   "LazyVim/LazyVim",
---   opts = {
---     colorscheme = "catppuccin-frappe",
---   },
--- },
