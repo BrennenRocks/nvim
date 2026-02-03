@@ -22,7 +22,7 @@ local function biome_lsp_or_prettier(bufnr)
   if has_prettier then
     return { "prettier" }
   end
-  return { "biome" }
+  return { "biome", "biome-organize-imports" }
 end
 
 return {
