@@ -4,7 +4,7 @@ local function biome_lsp_or_prettier(bufnr)
     name = "biome",
   })[1]
   if has_biome_lsp then
-    return {}
+    return { "biome", "biome-organize-imports" }
   end
   local has_prettier = vim.fs.find({
     -- https://prettier.io/docs/en/configuration.html
