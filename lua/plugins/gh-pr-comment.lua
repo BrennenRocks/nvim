@@ -226,7 +226,7 @@ local function place_signs(tabpage, file_path)
   local file_comments = comments_for_file(file_path)
   for _, c in ipairs(file_comments) do
     local line = c.line
-    if line and line >= 1 then
+    if type(line) == "number" and line >= 1 then
       local bufnr = (c.side == "LEFT") and original_bufnr or modified_bufnr
       if vim.api.nvim_buf_is_valid(bufnr) then
         local line_count = vim.api.nvim_buf_line_count(bufnr)
