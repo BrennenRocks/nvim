@@ -32,9 +32,25 @@ local function get_codediff_context()
 
   local side = current_win == original_win and "LEFT" or "RIGHT"
 
-  -- Always use original_path — it's consistently the git-relative path.
-  -- modified_path can be an absolute filesystem path for working tree buffers.
-  return { side = side, file_path = original_path }
+  -- For existing files, original_path is the git-relative path.
+  -- For new files, original_path is empty — fall back to modified_path.
+  local file_path = original_path
+  if not file_path or file_path == "" then
+    file_path = modified_path
+  end
+  if not file_path or file_path == "" then
+    return nil
+  end
+
+  -- modified_path can be absolute; convert to git-relative if needed.
+  if file_path:sub(1, 1) == "/" then
+    local git_root = vim.fn.system("git rev-parse --show-toplevel"):gsub("%s+$", "")
+    if vim.startswith(file_path, git_root .. "/") then
+      file_path = file_path:sub(#git_root + 2)
+    end
+  end
+
+  return { side = side, file_path = file_path }
 end
 
 local function open_comment_buffer(on_submit, initial_lines)
