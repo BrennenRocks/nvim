@@ -159,6 +159,7 @@ local function fetch_comments(pr, on_done)
     return
   end
   fetch_in_progress = true
+  vim.notify("Loading PR comments…", vim.log.levels.INFO)
 
   local stdout_chunks = {}
   vim.fn.jobstart({
@@ -240,6 +241,19 @@ local function place_signs(tabpage, file_path)
   end
 
   local file_comments = comments_for_file(file_path)
+
+  -- Group root comments by (side, line) for virtual text preview
+  local by_line = {} -- key: "LEFT:10" or "RIGHT:10", value: list of root comments
+  for _, c in ipairs(file_comments) do
+    if not c.in_reply_to_id and type(c.line) == "number" and c.line >= 1 then
+      local key = (c.side or "RIGHT") .. ":" .. c.line
+      if not by_line[key] then
+        by_line[key] = {}
+      end
+      table.insert(by_line[key], c)
+    end
+  end
+
   for _, c in ipairs(file_comments) do
     local line = c.line
     if type(line) == "number" and line >= 1 then
@@ -247,10 +261,33 @@ local function place_signs(tabpage, file_path)
       if vim.api.nvim_buf_is_valid(bufnr) then
         local line_count = vim.api.nvim_buf_line_count(bufnr)
         if line <= line_count then
+          -- Build virtual text only for root comments (avoid duplicates from replies)
+          local virt_text = nil
+          if not c.in_reply_to_id then
+            local key = (c.side or "RIGHT") .. ":" .. line
+            local roots = by_line[key]
+            if roots and roots[1] and roots[1].id == c.id then
+              local user = (c.user and c.user.login) or "unknown"
+              local preview = c.body:gsub("\n", " ")
+              if #preview > 50 then
+                preview = preview:sub(1, 47) .. "..."
+              end
+              local count_suffix = ""
+              if #roots > 1 then
+                count_suffix = string.format(" (+%d more)", #roots - 1)
+              end
+              virt_text = {
+                { string.format(" @%s: %s%s", user, preview, count_suffix), "DiagnosticHint" },
+              }
+            end
+          end
+
           pcall(vim.api.nvim_buf_set_extmark, bufnr, ns, line - 1, 0, {
             sign_text = "◆",
             sign_hl_group = "DiagnosticSignInfo",
             priority = 150,
+            virt_text = virt_text,
+            virt_text_pos = "eol",
           })
         end
       end
@@ -424,10 +461,21 @@ refresh_signs_current = function()
     return
   end
   local tabpage = vim.api.nvim_get_current_tabpage()
-  local file_path = lifecycle.get_paths(tabpage)
-  if file_path then
-    place_signs(tabpage, file_path)
+  local original_path, modified_path = lifecycle.get_paths(tabpage)
+  local file_path = original_path
+  if not file_path or file_path == "" then
+    file_path = modified_path
   end
+  if not file_path or file_path == "" then
+    return
+  end
+  if file_path:sub(1, 1) == "/" then
+    local git_root = vim.fn.system("git rev-parse --show-toplevel"):gsub("%s+$", "")
+    if vim.startswith(file_path, git_root .. "/") then
+      file_path = file_path:sub(#git_root + 2)
+    end
+  end
+  place_signs(tabpage, file_path)
 end
 
 --- Reply to a review comment thread via the GitHub API.
@@ -730,56 +778,103 @@ vim.keymap.set("n", "<leader>gR", function()
   end)
 end, { desc = "Refresh PR comments" })
 
--- Jump to next/previous comment — uses cached_comments + codediff context
--- rather than extmarks (which can be cleared by other operations).
-local function get_comment_lines()
-  local diff = get_codediff_context()
-  if not diff then
+-- Jump to next/previous comment — collects comments from both sides and
+-- jumps to the correct codediff window regardless of which window is focused.
+local function get_all_comment_entries()
+  local ok, lifecycle = pcall(require, "codediff.ui.lifecycle")
+  if not ok then
     return nil
   end
-  local file_comments = comments_for_file(diff.file_path)
-  local seen = {}
-  local lines = {}
-  for _, c in ipairs(file_comments) do
-    if c.side == diff.side and c.line and c.line >= 1 and not seen[c.line] then
-      seen[c.line] = true
-      table.insert(lines, c.line)
+  local tabpage = vim.api.nvim_get_current_tabpage()
+  local original_path, modified_path = lifecycle.get_paths(tabpage)
+  local file_path = original_path
+  if not file_path or file_path == "" then
+    file_path = modified_path
+  end
+  if not file_path or file_path == "" then
+    return nil
+  end
+  -- Convert absolute paths to git-relative
+  if file_path:sub(1, 1) == "/" then
+    local git_root = vim.fn.system("git rev-parse --show-toplevel"):gsub("%s+$", "")
+    if vim.startswith(file_path, git_root .. "/") then
+      file_path = file_path:sub(#git_root + 2)
     end
   end
-  table.sort(lines)
-  return lines
+  local original_win, modified_win = lifecycle.get_windows(tabpage)
+  local original_bufnr, modified_bufnr = lifecycle.get_buffers(tabpage)
+  if not modified_win then
+    return nil
+  end
+
+  local file_comments = comments_for_file(file_path)
+  local seen = {}
+  local entries = {}
+  for _, c in ipairs(file_comments) do
+    if type(c.line) == "number" and c.line >= 1 then
+      local key = (c.side or "RIGHT") .. ":" .. c.line
+      if not seen[key] then
+        seen[key] = true
+        local win = (c.side == "LEFT") and original_win or modified_win
+        local bufnr = (c.side == "LEFT") and original_bufnr or modified_bufnr
+        table.insert(entries, { line = c.line, win = win, bufnr = bufnr })
+      end
+    end
+  end
+  table.sort(entries, function(a, b)
+    return a.line < b.line
+  end)
+  return entries
+end
+
+local function jump_to_entry(entry)
+  if not vim.api.nvim_win_is_valid(entry.win) then
+    return
+  end
+  local line_count = vim.api.nvim_buf_line_count(entry.bufnr)
+  local target = math.min(entry.line, line_count)
+  vim.api.nvim_set_current_win(entry.win)
+  vim.api.nvim_win_set_cursor(entry.win, { target, 0 })
 end
 
 vim.keymap.set("n", "]g", function()
-  local lines = get_comment_lines()
-  if not lines or #lines == 0 then
-    vim.notify("No comments in this buffer", vim.log.levels.INFO)
+  if fetch_in_progress then
+    vim.notify("Comments still loading…", vim.log.levels.WARN)
+    return
+  end
+  local entries = get_all_comment_entries()
+  if not entries or #entries == 0 then
+    vim.notify("No comments in this file", vim.log.levels.INFO)
     return
   end
   local cursor_line = vim.fn.line(".")
-  for _, line in ipairs(lines) do
-    if line > cursor_line then
-      vim.api.nvim_win_set_cursor(0, { line, 0 })
+  for _, entry in ipairs(entries) do
+    if entry.line > cursor_line then
+      jump_to_entry(entry)
       return
     end
   end
-  vim.api.nvim_win_set_cursor(0, { lines[1], 0 })
+  jump_to_entry(entries[1])
 end, { desc = "Next PR comment" })
 
 vim.keymap.set("n", "[g", function()
-  local lines = get_comment_lines()
-  if not lines or #lines == 0 then
-    vim.notify("No comments in this buffer", vim.log.levels.INFO)
+  if fetch_in_progress then
+    vim.notify("Comments still loading…", vim.log.levels.WARN)
+    return
+  end
+  local entries = get_all_comment_entries()
+  if not entries or #entries == 0 then
+    vim.notify("No comments in this file", vim.log.levels.INFO)
     return
   end
   local cursor_line = vim.fn.line(".")
-  for i = #lines, 1, -1 do
-    if lines[i] < cursor_line then
-      vim.api.nvim_win_set_cursor(0, { lines[i], 0 })
+  for i = #entries, 1, -1 do
+    if entries[i].line < cursor_line then
+      jump_to_entry(entries[i])
       return
     end
   end
-  vim.api.nvim_win_set_cursor(0, { lines[#lines], 0 })
+  jump_to_entry(entries[#entries])
 end, { desc = "Previous PR comment" })
 
 -- Visual mode: suggest changes
