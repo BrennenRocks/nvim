@@ -4,6 +4,8 @@ local ns = vim.api.nvim_create_namespace("gh-pr-comments")
 local cached_comments = nil
 local fetch_in_progress = false
 local refresh_signs_current
+local fetch_thread_resolution
+local show_resolved = true -- toggle for filtering resolved comments
 
 local function get_pr_context()
   local pr_number = vim.env.PR_NUMBER
@@ -200,13 +202,100 @@ local function fetch_comments(pr, on_done)
           end
         end
         cached_comments = flat
-        on_done(cached_comments)
+        -- Fetch thread resolution status, then call on_done
+        fetch_thread_resolution(pr, function()
+          on_done(cached_comments)
+        end)
       end)
     end,
   })
 end
 
---- Filter cached comments for a specific file path.
+--- Fetch thread resolution status via GraphQL and tag cached comments.
+fetch_thread_resolution = function(pr, on_done)
+  local owner, repo = pr.repo_name:match("^(.+)/(.+)$")
+  if not owner or not repo then
+    if on_done then on_done() end
+    return
+  end
+
+  local query = string.format([[
+query {
+  repository(owner: "%s", name: "%s") {
+    pullRequest(number: %s) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 1) {
+            nodes { databaseId }
+          }
+        }
+      }
+    }
+  }
+}]], owner, repo, pr.pr_number)
+
+  local stdout_chunks = {}
+  vim.fn.jobstart({
+    "gh", "api", "graphql", "-f", "query=" .. query,
+  }, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      if data then vim.list_extend(stdout_chunks, data) end
+    end,
+    on_exit = function(_, exit_code)
+      vim.schedule(function()
+        if exit_code ~= 0 or not cached_comments then
+          if on_done then on_done() end
+          return
+        end
+        local raw = table.concat(stdout_chunks, "\n")
+        local ok, parsed = pcall(vim.json.decode, raw)
+        if not ok or type(parsed) ~= "table" then
+          if on_done then on_done() end
+          return
+        end
+
+        -- Build a map: root_comment_database_id -> isResolved
+        local resolved_map = {}
+        local threads = (parsed.data
+          and parsed.data.repository
+          and parsed.data.repository.pullRequest
+          and parsed.data.repository.pullRequest.reviewThreads
+          and parsed.data.repository.pullRequest.reviewThreads.nodes) or {}
+        for _, thread in ipairs(threads) do
+          local comments = (thread.comments and thread.comments.nodes) or {}
+          if #comments > 0 and comments[1].databaseId then
+            resolved_map[comments[1].databaseId] = thread.isResolved
+          end
+        end
+
+        -- Tag each cached comment: root gets _resolved directly,
+        -- replies inherit from their root
+        for _, c in ipairs(cached_comments) do
+          if not c.in_reply_to_id and resolved_map[c.id] ~= nil then
+            c._resolved = resolved_map[c.id]
+          end
+        end
+        -- Tag replies based on their root
+        for _, c in ipairs(cached_comments) do
+          if c.in_reply_to_id then
+            for _, root in ipairs(cached_comments) do
+              if root.id == c.in_reply_to_id then
+                c._resolved = root._resolved
+                break
+              end
+            end
+          end
+        end
+
+        if on_done then on_done() end
+      end)
+    end,
+  })
+end
+
+--- Filter cached comments for a specific file path (respects show_resolved toggle).
 local function comments_for_file(path)
   if not cached_comments then
     return {}
@@ -214,7 +303,9 @@ local function comments_for_file(path)
   local result = {}
   for _, c in ipairs(cached_comments) do
     if c.path == path then
-      table.insert(result, c)
+      if show_resolved or not c._resolved then
+        table.insert(result, c)
+      end
     end
   end
   return result
@@ -765,7 +856,7 @@ end, { desc = "Post PR review comment" })
 vim.keymap.set("n", "<leader>gC", open_comment_menu, { desc = "PR comment actions" })
 
 -- Refresh comments from GitHub
-vim.keymap.set("n", "<leader>gr", function()
+vim.keymap.set("n", "<leader>gR", function()
   local pr = get_pr_context()
   if not pr then
     vim.notify("No PR context.", vim.log.levels.WARN)
@@ -778,47 +869,38 @@ vim.keymap.set("n", "<leader>gr", function()
   end)
 end, { desc = "Refresh PR comments" })
 
--- Populate quickfix with all PR comments across all files
-vim.keymap.set("n", "<leader>gq", function()
-  local pr = get_pr_context()
-  if not pr then
-    vim.notify("No PR context.", vim.log.levels.WARN)
-    return
-  end
-  if fetch_in_progress then
-    vim.notify("Comments still loading…", vim.log.levels.WARN)
-    return
-  end
-  if not cached_comments or #cached_comments == 0 then
-    vim.notify("No comments loaded. Press <leader>gR to refresh.", vim.log.levels.INFO)
-    return
-  end
-
+-- Build quickfix items from cached comments (respects show_resolved filter)
+local function build_qf_items()
   local items = {}
+  if not cached_comments then
+    return items
+  end
   for _, c in ipairs(cached_comments) do
     if not c.in_reply_to_id then
-      local lnum = (type(c.line) == "number" and c.line >= 1) and c.line or 1
-      local user = (c.user and c.user.login) or "unknown"
-      local body = c.body:gsub("\n", " ")
-      if #body > 80 then
-        body = body:sub(1, 77) .. "..."
-      end
-
-      -- Count replies to this thread
-      local reply_count = 0
-      for _, r in ipairs(cached_comments) do
-        if r.in_reply_to_id == c.id then
-          reply_count = reply_count + 1
+      if show_resolved or not c._resolved then
+        local lnum = (type(c.line) == "number" and c.line >= 1) and c.line or 1
+        local user = (c.user and c.user.login) or "unknown"
+        local body = c.body:gsub("\n", " ")
+        if #body > 80 then
+          body = body:sub(1, 77) .. "..."
         end
-      end
-      local suffix = reply_count > 0 and string.format(" [%d replies]", reply_count) or ""
 
-      table.insert(items, {
-        filename = c.path or "",
-        lnum = lnum,
-        col = 1,
-        text = string.format("@%s: %s%s", user, body, suffix),
-      })
+        local reply_count = 0
+        for _, r in ipairs(cached_comments) do
+          if r.in_reply_to_id == c.id then
+            reply_count = reply_count + 1
+          end
+        end
+        local suffix = reply_count > 0 and string.format(" [%d replies]", reply_count) or ""
+        local resolved_tag = c._resolved and " [resolved]" or ""
+
+        table.insert(items, {
+          filename = c.path or "",
+          lnum = lnum,
+          col = 1,
+          text = string.format("@%s: %s%s%s", user, body, suffix, resolved_tag),
+        })
+      end
     end
   end
 
@@ -828,12 +910,14 @@ vim.keymap.set("n", "<leader>gq", function()
     end
     return a.lnum < b.lnum
   end)
+  return items
+end
 
-  vim.fn.setqflist({}, " ", { title = "PR Comments", items = items })
-  vim.cmd("copen")
-
-  -- Override <CR> in the quickfix buffer to select the file in CodeDiff
+-- Set up quickfix buffer keymaps (called each time the qf list is populated)
+local function setup_qf_keymaps(items)
   local qf_buf = vim.api.nvim_get_current_buf()
+
+  -- <CR>: open in CodeDiff
   vim.keymap.set("n", "<CR>", function()
     local idx = vim.fn.line(".")
     local qf_items = vim.fn.getqflist()
@@ -847,7 +931,6 @@ vim.keymap.set("n", "<leader>gq", function()
       return
     end
 
-    -- Find the CodeDiff tabpage (may not be the current one if qf is focused)
     local tabpage = vim.api.nvim_get_current_tabpage()
     local explorer = lifecycle.get_explorer(tabpage)
     if not explorer or not explorer.on_file_select then
@@ -855,14 +938,9 @@ vim.keymap.set("n", "<leader>gq", function()
       return
     end
 
-    -- Look up the file in the explorer tree to get the full node data
     local refresh_module = require("codediff.ui.explorer.refresh")
     local all_files = refresh_module.get_all_files(explorer.tree)
-    local target_path = item.text and items[idx] and items[idx].filename or ""
-    -- Get filename from the qflist bufnr or from our items table
-    if items[idx] then
-      target_path = items[idx].filename
-    end
+    local target_path = items[idx] and items[idx].filename or ""
 
     local file_data
     for _, f in ipairs(all_files) do
@@ -899,7 +977,70 @@ vim.keymap.set("n", "<leader>gq", function()
     end
     jump_to_comment_line()
   end, { buffer = qf_buf, desc = "Open in CodeDiff" })
+
+  -- R: toggle resolved filter
+  vim.keymap.set("n", "R", function()
+    show_resolved = not show_resolved
+    local new_items = build_qf_items()
+    local filter_label = show_resolved and "all" or "unresolved only"
+    vim.fn.setqflist({}, " ", { title = "PR Comments (" .. filter_label .. ")", items = new_items })
+    vim.cmd("copen")
+    setup_qf_keymaps(new_items)
+    refresh_signs_current()
+    vim.notify("Filter: " .. filter_label, vim.log.levels.INFO)
+  end, { buffer = qf_buf, desc = "Toggle resolved filter" })
+end
+
+-- Populate quickfix with all PR comments across all files
+vim.keymap.set("n", "<leader>gq", function()
+  local pr = get_pr_context()
+  if not pr then
+    vim.notify("No PR context.", vim.log.levels.WARN)
+    return
+  end
+  if fetch_in_progress then
+    vim.notify("Comments still loading…", vim.log.levels.WARN)
+    return
+  end
+  if not cached_comments or #cached_comments == 0 then
+    vim.notify("No comments loaded. Press <leader>gR to refresh.", vim.log.levels.INFO)
+    return
+  end
+
+  local items = build_qf_items()
+  local filter_label = show_resolved and "all" or "unresolved only"
+  vim.fn.setqflist({}, " ", { title = "PR Comments (" .. filter_label .. ")", items = items })
+  vim.cmd("copen")
+  setup_qf_keymaps(items)
 end, { desc = "PR comments to quickfix" })
+
+-- Toggle resolved filter globally (signs, virtual text, navigation, quickfix)
+vim.keymap.set("n", "<leader>gr", function()
+  show_resolved = not show_resolved
+  local filter_label = show_resolved and "all" or "unresolved only"
+  vim.notify("PR comments: " .. filter_label, vim.log.levels.INFO)
+
+  -- Refresh signs on all codediff tabpages
+  local ok, lifecycle = pcall(require, "codediff.ui.lifecycle")
+  if ok then
+    for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do
+      local original_path, modified_path = lifecycle.get_paths(tabpage)
+      local file_path = original_path
+      if not file_path or file_path == "" then
+        file_path = modified_path
+      end
+      if file_path and file_path ~= "" then
+        if file_path:sub(1, 1) == "/" then
+          local git_root = vim.fn.system("git rev-parse --show-toplevel"):gsub("%s+$", "")
+          if vim.startswith(file_path, git_root .. "/") then
+            file_path = file_path:sub(#git_root + 2)
+          end
+        end
+        place_signs(tabpage, file_path)
+      end
+    end
+  end
+end, { desc = "Toggle resolved comment filter" })
 
 -- Jump to next/previous comment — collects comments from both sides and
 -- jumps to the correct codediff window regardless of which window is focused.
