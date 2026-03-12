@@ -765,7 +765,7 @@ end, { desc = "Post PR review comment" })
 vim.keymap.set("n", "<leader>gC", open_comment_menu, { desc = "PR comment actions" })
 
 -- Refresh comments from GitHub
-vim.keymap.set("n", "<leader>gR", function()
+vim.keymap.set("n", "<leader>gr", function()
   local pr = get_pr_context()
   if not pr then
     vim.notify("No PR context.", vim.log.levels.WARN)
@@ -777,6 +777,129 @@ vim.keymap.set("n", "<leader>gR", function()
     refresh_signs_current()
   end)
 end, { desc = "Refresh PR comments" })
+
+-- Populate quickfix with all PR comments across all files
+vim.keymap.set("n", "<leader>gq", function()
+  local pr = get_pr_context()
+  if not pr then
+    vim.notify("No PR context.", vim.log.levels.WARN)
+    return
+  end
+  if fetch_in_progress then
+    vim.notify("Comments still loading…", vim.log.levels.WARN)
+    return
+  end
+  if not cached_comments or #cached_comments == 0 then
+    vim.notify("No comments loaded. Press <leader>gR to refresh.", vim.log.levels.INFO)
+    return
+  end
+
+  local items = {}
+  for _, c in ipairs(cached_comments) do
+    if not c.in_reply_to_id then
+      local lnum = (type(c.line) == "number" and c.line >= 1) and c.line or 1
+      local user = (c.user and c.user.login) or "unknown"
+      local body = c.body:gsub("\n", " ")
+      if #body > 80 then
+        body = body:sub(1, 77) .. "..."
+      end
+
+      -- Count replies to this thread
+      local reply_count = 0
+      for _, r in ipairs(cached_comments) do
+        if r.in_reply_to_id == c.id then
+          reply_count = reply_count + 1
+        end
+      end
+      local suffix = reply_count > 0 and string.format(" [%d replies]", reply_count) or ""
+
+      table.insert(items, {
+        filename = c.path or "",
+        lnum = lnum,
+        col = 1,
+        text = string.format("@%s: %s%s", user, body, suffix),
+      })
+    end
+  end
+
+  table.sort(items, function(a, b)
+    if a.filename ~= b.filename then
+      return a.filename < b.filename
+    end
+    return a.lnum < b.lnum
+  end)
+
+  vim.fn.setqflist({}, " ", { title = "PR Comments", items = items })
+  vim.cmd("copen")
+
+  -- Override <CR> in the quickfix buffer to select the file in CodeDiff
+  local qf_buf = vim.api.nvim_get_current_buf()
+  vim.keymap.set("n", "<CR>", function()
+    local idx = vim.fn.line(".")
+    local qf_items = vim.fn.getqflist()
+    local item = qf_items[idx]
+    if not item then
+      return
+    end
+
+    local ok, lifecycle = pcall(require, "codediff.ui.lifecycle")
+    if not ok then
+      return
+    end
+
+    -- Find the CodeDiff tabpage (may not be the current one if qf is focused)
+    local tabpage = vim.api.nvim_get_current_tabpage()
+    local explorer = lifecycle.get_explorer(tabpage)
+    if not explorer or not explorer.on_file_select then
+      vim.cmd("cc " .. idx)
+      return
+    end
+
+    -- Look up the file in the explorer tree to get the full node data
+    local refresh_module = require("codediff.ui.explorer.refresh")
+    local all_files = refresh_module.get_all_files(explorer.tree)
+    local target_path = item.text and items[idx] and items[idx].filename or ""
+    -- Get filename from the qflist bufnr or from our items table
+    if items[idx] then
+      target_path = items[idx].filename
+    end
+
+    local file_data
+    for _, f in ipairs(all_files) do
+      if f.data.path == target_path then
+        file_data = f.data
+        break
+      end
+    end
+
+    local lnum = item.lnum or 1
+    local function jump_to_comment_line()
+      vim.defer_fn(function()
+        local _, modified_win = lifecycle.get_windows(tabpage)
+        local target_win = modified_win
+        if target_win and vim.api.nvim_win_is_valid(target_win) then
+          local bufnr = vim.api.nvim_win_get_buf(target_win)
+          local line_count = vim.api.nvim_buf_line_count(bufnr)
+          local target = math.min(lnum, line_count)
+          vim.api.nvim_set_current_win(target_win)
+          vim.api.nvim_win_set_cursor(target_win, { target, 0 })
+        end
+      end, 300)
+    end
+
+    vim.cmd("cclose")
+    if file_data then
+      explorer.on_file_select(file_data)
+    else
+      explorer.on_file_select({
+        path = target_path,
+        group = "unstaged",
+        status = "M",
+      })
+    end
+    jump_to_comment_line()
+  end, { buffer = qf_buf, desc = "Open in CodeDiff" })
+end, { desc = "PR comments to quickfix" })
 
 -- Jump to next/previous comment — collects comments from both sides and
 -- jumps to the correct codediff window regardless of which window is focused.
