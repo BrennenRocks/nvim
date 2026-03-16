@@ -618,6 +618,31 @@ local function reply_to_comment(pr, root_comment_id, body)
   })
 end
 
+--- Add a reaction to a comment via the GitHub API.
+local function react_to_comment(pr, comment_id, reaction)
+  local stderr_chunks = {}
+  vim.fn.jobstart({
+    "gh", "api", "-X", "POST",
+    string.format("repos/%s/pulls/comments/%s/reactions", pr.repo_name, comment_id),
+    "-f", "content=" .. reaction,
+  }, {
+    stderr_buffered = true,
+    on_stderr = function(_, data)
+      if data then vim.list_extend(stderr_chunks, data) end
+    end,
+    on_exit = function(_, exit_code)
+      vim.schedule(function()
+        if exit_code == 0 then
+          vim.notify(reaction .. " added", vim.log.levels.INFO)
+        else
+          local err = table.concat(stderr_chunks, "\n"):gsub("^%s+", ""):gsub("%s+$", "")
+          vim.notify("Failed to react:\n" .. err, vim.log.levels.ERROR)
+        end
+      end)
+    end,
+  })
+end
+
 --- Open the comment actions menu for the current cursor line.
 local function open_comment_menu()
   local pr = get_pr_context()
@@ -659,7 +684,7 @@ local function open_comment_menu()
     end
   end
   table.insert(lines, "")
-  table.insert(lines, "c: comment  r: reply  u: update  d: delete  q: close")
+  table.insert(lines, "c: comment  r: reply  u: update  d: delete  e: react  q: close")
 
   -- Compute float dimensions
   local max_width = 20
@@ -768,6 +793,37 @@ local function open_comment_menu()
       }, function(choice)
         if choice == "Yes" then
           delete_comment(pr, comment.id, refresh_signs_current)
+        end
+      end)
+    end)
+  end, { buffer = buf })
+
+  -- e: react to a comment
+  vim.keymap.set("n", "e", function()
+    close()
+    if #all_comments == 0 then
+      vim.notify("No comments on this line to react to", vim.log.levels.INFO)
+      return
+    end
+    pick_comment(all_comments, "Select comment to react to:", function(comment)
+      local reactions = {
+        { "+1", "thumbs up" },
+        { "-1", "thumbs down" },
+        { "laugh", "laugh" },
+        { "confused", "confused" },
+        { "heart", "heart" },
+        { "hooray", "hooray" },
+        { "rocket", "rocket" },
+        { "eyes", "eyes" },
+      }
+      vim.ui.select(reactions, {
+        prompt = "Reaction:",
+        format_item = function(r)
+          return r[2]
+        end,
+      }, function(choice)
+        if choice then
+          react_to_comment(pr, comment.id, choice[1])
         end
       end)
     end)
