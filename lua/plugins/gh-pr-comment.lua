@@ -1099,6 +1099,142 @@ vim.keymap.set("n", "<leader>gr", function()
   end
 end, { desc = "Toggle resolved comment filter" })
 
+-- Copy unresolved PR comments to clipboard via selection float
+vim.keymap.set("n", "<leader>gy", function()
+  if not cached_comments or #cached_comments == 0 then
+    vim.notify("No PR comments loaded. Press <leader>gR first.", vim.log.levels.WARN)
+    return
+  end
+
+  -- Collect unresolved root comments across all files
+  local items = {}
+  for _, c in ipairs(cached_comments) do
+    if not c.in_reply_to_id and not c._resolved and type(c.line) == "number" and c.line >= 1 then
+      local body = (c.body or ""):gsub("\n", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      table.insert(items, {
+        path = c.path or "unknown",
+        line = c.line,
+        body = body,
+        label = string.format("%s:%d — %s", c.path or "unknown", c.line, body),
+      })
+    end
+  end
+  table.sort(items, function(a, b)
+    if a.path ~= b.path then return a.path < b.path end
+    return a.line < b.line
+  end)
+
+  if #items == 0 then
+    vim.notify("No unresolved comments to copy", vim.log.levels.INFO)
+    return
+  end
+
+  -- Selection state: all selected by default
+  local selected = {}
+  for i = 1, #items do
+    selected[i] = true
+  end
+
+  local max_width = math.min(120, math.floor(vim.o.columns * 0.9))
+  local max_height = math.min(#items + 2, math.floor(vim.o.lines * 0.7))
+
+  local function build_lines()
+    local lines = {}
+    for i, item in ipairs(items) do
+      local check = selected[i] and "[x]" or "[ ]"
+      local text = string.format("%s %s", check, item.label)
+      -- Truncate to window width so each item is one visual line
+      if #text > max_width - 2 then
+        text = text:sub(1, max_width - 5) .. "..."
+      end
+      table.insert(lines, text)
+    end
+    table.insert(lines, "")
+    table.insert(lines, "SPC:toggle  y:copy  a:all  n:none  /:search  q:close")
+    return lines
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines())
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].modifiable = false
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - max_height) / 2),
+    col = math.floor((vim.o.columns - max_width) / 2),
+    width = max_width,
+    height = max_height,
+    style = "minimal",
+    border = "rounded",
+    title = " Unresolved PR Comments ",
+    title_pos = "center",
+  })
+  vim.wo[win].scrollbind = false
+  vim.wo[win].cursorbind = false
+  vim.wo[win].wrap = false
+
+  local function refresh()
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, build_lines())
+    vim.bo[buf].modifiable = false
+  end
+
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
+  -- <Space>: toggle current line
+  vim.keymap.set("n", "<Space>", function()
+    local row = vim.api.nvim_win_get_cursor(win)[1]
+    if row <= #items then
+      selected[row] = not selected[row]
+      refresh()
+      vim.api.nvim_win_set_cursor(win, { math.min(row + 1, #items), 0 })
+    end
+  end, { buffer = buf })
+
+  -- a: select all
+  vim.keymap.set("n", "a", function()
+    for i = 1, #items do selected[i] = true end
+    refresh()
+  end, { buffer = buf })
+
+  -- n: deselect all
+  vim.keymap.set("n", "n", function()
+    for i = 1, #items do selected[i] = false end
+    refresh()
+  end, { buffer = buf })
+
+  -- y: copy selected and close
+  vim.keymap.set("n", "y", function()
+    local result = {}
+    for i, item in ipairs(items) do
+      if selected[i] then
+        table.insert(result, item.label)
+      end
+    end
+    if #result == 0 then
+      vim.notify("No comments selected", vim.log.levels.WARN)
+      return
+    end
+    vim.fn.setreg("+", table.concat(result, "\n"))
+    close()
+    vim.notify(string.format("Copied %d comment(s) to clipboard", #result), vim.log.levels.INFO)
+  end, { buffer = buf })
+
+  -- /: search — use native Neovim search in the float buffer
+  vim.keymap.set("n", "/", function()
+    vim.api.nvim_feedkeys("/", "n", false)
+  end, { buffer = buf })
+
+  -- q / Esc: close
+  vim.keymap.set("n", "q", close, { buffer = buf })
+  vim.keymap.set("n", "<Esc>", close, { buffer = buf })
+end, { desc = "Copy unresolved PR comments to clipboard" })
+
 -- Jump to next/previous comment — collects comments from both sides and
 -- jumps to the correct codediff window regardless of which window is focused.
 local function get_all_comment_entries()
