@@ -686,15 +686,14 @@ local function open_comment_menu()
   table.insert(lines, "")
   table.insert(lines, "c: comment  r: reply  u: update  d: delete  e: react  q: close")
 
-  -- Compute float dimensions
-  local max_width = 20
+  -- Compute float dimensions (fixed width with wrapping)
+  local max_width = math.min(80, math.floor(vim.o.columns * 0.8))
+  -- Estimate wrapped line count for height
+  local wrapped_lines = 0
   for _, l in ipairs(lines) do
-    if #l > max_width then
-      max_width = #l
-    end
+    wrapped_lines = wrapped_lines + math.max(1, math.ceil(#l / max_width))
   end
-  max_width = math.min(max_width + 2, math.floor(vim.o.columns * 0.8))
-  local max_height = math.min(#lines, math.floor(vim.o.lines * 0.6))
+  local max_height = math.min(wrapped_lines, math.floor(vim.o.lines * 0.6))
 
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -713,6 +712,8 @@ local function open_comment_menu()
   })
   vim.wo[win].scrollbind = false
   vim.wo[win].cursorbind = false
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
 
   local function close()
     if vim.api.nvim_win_is_valid(win) then
